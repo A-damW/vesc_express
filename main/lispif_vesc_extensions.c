@@ -20,7 +20,11 @@
  */
 
 #include "eval_cps.h"
+#include "extensions.h"
+#include "heap.h"
 #include "lbm_defines.h"
+#include "lbm_flat_value.h"
+#include "lbm_memory.h"
 #include "lbm_types.h"
 #include "main.h"
 #include "lispif.h"
@@ -61,6 +65,7 @@
 #include "comm_uart.h"
 #include "comm_ble.h"
 #include "lbm_image.h"
+#include "packet.h"
 
 #include "esp_netif.h"
 #include "esp_wifi.h"
@@ -356,6 +361,10 @@ static bool compare_symbol(lbm_uint sym, lbm_uint *comp) {
 }
 
 static bool start_flatten_with_gc(lbm_flat_value_t *v, size_t buffer_size) {
+	if (lispif_is_eval_task()) {
+		return lbm_start_flatten(v, buffer_size);
+	}
+
 	if (lbm_start_flatten(v, buffer_size)) {
 		return true;
 	}
@@ -1804,7 +1813,7 @@ static void bms_cmd_handler(COMM_PACKET_ID cmd, int param1, int param2) {
 	case COMM_BMS_SET_CHARGE_ALLOWED: {
 		if (event_bms_chg_allow_en) {
 			lbm_flat_value_t v;
-			if (lbm_start_flatten(&v, 50)) {
+			if (start_flatten_with_gc(&v, 50)) {
 				f_cons(&v);
 				f_sym(&v, sym_bms_chg_allow);
 				f_cons(&v);
@@ -1821,7 +1830,7 @@ static void bms_cmd_handler(COMM_PACKET_ID cmd, int param1, int param2) {
 	case COMM_BMS_SET_BALANCE_OVERRIDE: {
 		if (event_bms_bal_ovr_en) {
 			lbm_flat_value_t v;
-			if (lbm_start_flatten(&v, 50)) {
+			if (start_flatten_with_gc(&v, 50)) {
 				f_cons(&v);
 				f_sym(&v, sym_bms_bal_ovr);
 				f_cons(&v);
@@ -1840,7 +1849,7 @@ static void bms_cmd_handler(COMM_PACKET_ID cmd, int param1, int param2) {
 	case COMM_BMS_RESET_COUNTERS: {
 		if (event_bms_reset_cnt_en) {
 			lbm_flat_value_t v;
-			if (lbm_start_flatten(&v, 50)) {
+			if (start_flatten_with_gc(&v, 50)) {
 				f_cons(&v);
 				f_sym(&v, sym_bms_reset_cnt);
 				f_cons(&v);
@@ -1859,7 +1868,7 @@ static void bms_cmd_handler(COMM_PACKET_ID cmd, int param1, int param2) {
 	case COMM_BMS_FORCE_BALANCE: {
 		if (event_bms_force_bal_en) {
 			lbm_flat_value_t v;
-			if (lbm_start_flatten(&v, 50)) {
+			if (start_flatten_with_gc(&v, 50)) {
 				f_cons(&v);
 				f_sym(&v, sym_bms_force_bal);
 				f_cons(&v);
@@ -1876,7 +1885,7 @@ static void bms_cmd_handler(COMM_PACKET_ID cmd, int param1, int param2) {
 	case COMM_BMS_ZERO_CURRENT_OFFSET: {
 		if (event_bms_zero_ofs_en) {
 			lbm_flat_value_t v;
-			if (lbm_start_flatten(&v, 50)) {
+			if (start_flatten_with_gc(&v, 50)) {
 				f_sym(&v, sym_bms_zero_ofs);
 
 				if (!lbm_event(&v)) {
@@ -1919,6 +1928,8 @@ static lbm_value ext_enable_event(lbm_value *args, lbm_uint argn) {
 		event_ble_rx_en = en;
 	} else if (name == sym_event_wifi_disconnect) {
 		event_wifi_disconnect_en = en;
+	} else if (name == sym_event_cmds_data_tx) {
+		event_cmds_data_tx_en = en;
 	} else if (name == sym_bms_chg_allow) {
 		event_bms_chg_allow_en = en;
 	} else if (name == sym_bms_bal_ovr) {
@@ -2125,7 +2136,7 @@ static void esp_rx_fun(void *arg) {
 		}
 
 		lbm_flat_value_t v;
-		if (lbm_start_flatten(&v, 150 + data.len)) {
+		if (start_flatten_with_gc(&v, 150 + data.len)) {
 			if (esp_now_recv_cid < 0) {
 				f_cons(&v);
 				f_sym(&v, sym_event_esp_now_rx);
@@ -2170,7 +2181,11 @@ static void esp_rx_fun(void *arg) {
 	}
 }
 
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 5, 0)
 static void espnow_send_cb(const uint8_t *mac_addr, esp_now_send_status_t status) {
+#else
+static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status) {
+#endif
 	lbm_unblock_ctx_unboxed(esp_now_send_cid, status == ESP_NOW_SEND_SUCCESS ? ENC_SYM_TRUE : ENC_SYM_NIL);
 }
 
@@ -2258,8 +2273,19 @@ static lbm_value ext_esp_now_add_peer(lbm_value *args, lbm_uint argn) {
 		return ENC_SYM_EERROR;
 	}
 
-	if (argn != 1 || !lbm_is_list(args[0])) {
-		return ENC_SYM_EERROR;
+	if ((argn != 1 && argn != 2) || !lbm_is_list(args[0])) {
+		lbm_set_error_reason(lbm_error_str_incorrect_arg);
+		return ENC_SYM_TERROR;
+	}
+
+	int rate = -1;
+	if (argn >= 2) {
+		if (!lbm_is_number(args[1]) || lbm_dec_as_i32(args[2]) > 15) {
+			lbm_set_error_reason(lbm_error_str_incorrect_arg);
+			return ENC_SYM_TERROR;
+		}
+
+		rate = lbm_dec_as_i32(args[2]);
 	}
 
 	uint8_t addr[ESP_NOW_ETH_ALEN] = {255, 255, 255, 255, 255, 255};
@@ -2290,6 +2316,15 @@ static lbm_value ext_esp_now_add_peer(lbm_value *args, lbm_uint argn) {
 	memcpy(peer.peer_addr, addr, ESP_NOW_ETH_ALEN);
 
 	esp_err_t res = esp_now_add_peer(&peer);
+
+	if (rate >= 0) {
+		esp_now_rate_config_t rate_cfg;
+		rate_cfg.phymode = WIFI_PHY_MODE_HT20;
+		rate_cfg.dcm = false;
+		rate_cfg.ersu = false;
+		rate_cfg.rate = rate;
+		esp_now_set_peer_rate_config(addr, &rate_cfg);
+	}
 
 	if (res == ESP_OK || res == ESP_ERR_ESPNOW_EXIST) {
 		return ENC_SYM_TRUE;
@@ -3299,6 +3334,116 @@ static lbm_value ext_ublox_init(lbm_value *args, lbm_uint argn) {
 	return ENC_SYM_NIL;
 }
 
+static lbm_value ext_nmea_parse(lbm_value *args, lbm_uint argn) {
+	if (argn != 1) {
+		lbm_set_error_reason((char*)lbm_error_str_num_args);
+		return ENC_SYM_TERROR;
+	}
+
+	char *str = lbm_dec_str(args[0]);
+	if (!str) {
+		return ENC_SYM_TERROR;
+	}
+
+	return nmea_decode_string(str) ? ENC_SYM_TRUE : ENC_SYM_NIL;
+}
+
+static lbm_value ext_set_pos_time(lbm_value *args, lbm_uint argn) {
+	nmea_state_t *s = nmea_get_state();
+
+	int gga_cnt = s->gga_cnt;
+	int rmc_cnt = s->rmc_cnt;
+
+	for (lbm_uint i = 0;i < argn;i++) {
+		lbm_value arg = args[i];
+
+		if (lbm_is_number(arg)) {
+			switch (i) {
+			case 0:
+			case 1:
+			case 2:
+			case 4:
+				if (s->gga_cnt == gga_cnt) {
+					s->gga_cnt++;
+					s->gga.update_time = xTaskGetTickCount();
+				}
+				break;
+
+			case 3:
+			case 6:
+			case 7:
+			case 8:
+				if (s->rmc_cnt == rmc_cnt) {
+					s->rmc_cnt++;
+					s->rmc.update_time = xTaskGetTickCount();
+				}
+				break;
+			}
+
+			switch (i) {
+			case 0: {
+				portDISABLE_INTERRUPTS();
+				s->gga.lat = lbm_dec_as_double(arg);
+				portENABLE_INTERRUPTS();
+			} break;
+
+			case 1: {
+				portDISABLE_INTERRUPTS();
+				s->gga.lon = lbm_dec_as_double(arg);
+				portENABLE_INTERRUPTS();
+			} break;
+
+			case 2: {
+				s->gga.height = lbm_dec_as_float(arg);
+			} break;
+
+			case 3: {
+				s->rmc.speed = lbm_dec_as_float(arg);
+			} break;
+
+			case 4: {
+				s->gga.h_dop = lbm_dec_as_float(arg);
+			} break;
+
+			case 5: {
+				s->gga.ms_today = lbm_dec_as_u32(arg);
+
+				s->rmc.ms = s->gga.ms_today % 1000;
+				s->rmc.ss = (s->gga.ms_today / 1000) % 60;
+				s->rmc.mm = (s->gga.ms_today / 1000 / 60) % 60;
+				s->rmc.hh = (s->gga.ms_today / 1000 / 60 / 60) % 24;
+
+				if (s->gga_cnt == gga_cnt) {
+					s->gga_cnt++;
+					s->gga.update_time = xTaskGetTickCount();
+				}
+
+				if (s->rmc_cnt == rmc_cnt) {
+					s->rmc_cnt++;
+					s->rmc.update_time = xTaskGetTickCount();
+				}
+			} break;
+
+			case 6: {
+				s->rmc.yy = lbm_dec_as_i32(arg);
+			} break;
+
+			case 7: {
+				s->rmc.mo = lbm_dec_as_i32(arg);
+			} break;
+
+			case 8: {
+				s->rmc.dd = lbm_dec_as_i32(arg);
+			} break;
+
+			default: break;
+			}
+		}
+	}
+
+	return ENC_SYM_TRUE;
+}
+
 static lbm_value ext_sleep_deep(lbm_value *args, lbm_uint argn) {
 	LBM_CHECK_ARGN_NUMBER(1);
 
@@ -3366,7 +3511,7 @@ static lbm_value ext_empty(lbm_value *args, lbm_uint argn) {
 }
 
 // Remote Messages
-#define RMSG_SLOT_NUM	5
+#define RMSG_SLOT_NUM	8
 
 typedef struct {
 	lbm_cid cid;
@@ -4910,10 +5055,12 @@ static lbm_value ext_uart_start(lbm_value *args, lbm_uint argn) {
 		return ENC_SYM_EERROR;
 	}
 
+	m_uart_number = -1;
+
+	xSemaphoreTake(m_uart_mutex, portMAX_DELAY);
 	ublox_stop(uart_num);
 	comm_uart_stop(uart_num);
 
-	xSemaphoreTake(m_uart_mutex, portMAX_DELAY);
 	if (uart_is_driver_installed(uart_num)) {
 		uart_driver_delete(uart_num);
 	}
@@ -6098,6 +6245,171 @@ static lbm_value ext_nvs_list(lbm_value *args, lbm_uint argn) {
    return nvs_list("nvs",NVS_DEFAULT_NS, NVS_TYPE_BLOB);
 }
 
+// Commands interface
+typedef struct {
+	PACKET_STATE_t cmds_packet_state;
+	void *cmds_thd_stack;
+	size_t cmds_thd_stack_size;
+	unsigned char buffer[PACKET_MAX_PL_LEN + 8];
+	unsigned int len;
+} cmds_send_data;
+
+static cmds_send_data *cmds_state = 0;
+static StaticTask_t cmds_thd;
+static volatile bool cmds_running = false;
+
+static void cmds_send_raw(unsigned char *buffer, unsigned int len) {
+	if (event_cmds_data_tx_en) {
+		int restart_cnt = lispif_get_restart_cnt();
+
+		lbm_flat_value_t v;
+		if (start_flatten_with_gc(&v, len + 30)) {
+			f_cons(&v);
+			f_sym(&v, sym_event_cmds_data_tx);
+			f_cons(&v);
+			f_lbm_array(&v, len, buffer);
+			f_sym(&v, ENC_SYM_NIL);
+			lbm_finish_flatten(&v);
+
+			int timeout = 500;
+			while (!lbm_event(&v)) {
+				if (restart_cnt != lispif_get_restart_cnt()) {
+					return;
+				}
+
+				if (timeout == 0 || lispif_is_eval_task() || !event_cmds_data_tx_en) {
+					lbm_free(v.buf);
+					return;
+				}
+
+				vTaskDelay(1);
+				timeout--;
+			}
+		}
+	}
+}
+
+static void cmds_send_packet(unsigned char *buffer, unsigned int len) {
+	if (cmds_state) {
+		packet_send_packet(buffer, len, &(cmds_state->cmds_packet_state));
+	}
+}
+
+static void cmds_send_task(void *arg) {
+	(void)arg;
+	commands_process_packet(cmds_state->buffer, cmds_state->len, cmds_send_packet);
+	vTaskDelete(NULL);
+}
+
+static void cmds_send_task_del(int a, void *arg) {
+	(void)a;
+	(void)arg;
+	cmds_running = false;
+}
+
+static void cmds_proc(unsigned char *data, unsigned int len) {
+	// 10 ms timeout. TODO: Block only task and not all of eval when waiting
+	int timeout = 10;
+	while (cmds_running) {
+		vTaskDelay(1);
+		timeout--;
+		if (timeout == 0) {
+			return;
+		}
+	}
+
+	if (!cmds_state) {
+		return;
+	}
+
+	memcpy(cmds_state->buffer, data, len);
+	cmds_state->len = len;
+
+	cmds_running = true;
+	TaskHandle_t task = xTaskCreateStaticPinnedToCore(
+		cmds_send_task,
+		"lbm_cmds",
+		cmds_state->cmds_thd_stack_size,
+		0,
+		8,
+		cmds_state->cmds_thd_stack,
+		&cmds_thd,
+		tskNO_AFFINITY
+	);
+
+	vTaskSetThreadLocalStoragePointerAndDelCallback(task, 0, 0, cmds_send_task_del);
+}
+
+static lbm_value ext_cmds_start_stop(lbm_value *args, lbm_uint argn) {
+	if (argn != 0 && argn != 1) {
+		lbm_set_error_reason(lbm_error_str_num_args);
+		return ENC_SYM_TERROR;
+	}
+
+	bool start = true;
+	if (argn >= 1) {
+		if (!is_symbol_true_false(args[0])) {
+			return ENC_SYM_TERROR;
+		}
+
+		start = lbm_is_symbol_true(args[0]);
+	}
+
+	while (cmds_running) {
+		vTaskDelay(1);
+	}
+
+	cmds_running = false;
+
+	if (cmds_state) {
+		lbm_free(cmds_state->cmds_thd_stack);
+		lbm_free(cmds_state);
+		cmds_state = 0;
+	}
+
+	if (start) {
+		cmds_state = lbm_malloc(sizeof(cmds_send_data));
+
+		if (!cmds_state) {
+			return ENC_SYM_MERROR;
+		}
+
+		cmds_state->cmds_thd_stack = lbm_malloc(3500);
+		cmds_state->cmds_thd_stack_size = 3500;
+
+		if (!cmds_state->cmds_thd_stack) {
+			lbm_free(cmds_state);
+			cmds_state = 0;
+			return ENC_SYM_MERROR;
+		}
+
+		packet_init(cmds_send_raw, cmds_proc, &(cmds_state->cmds_packet_state));
+	}
+
+	return ENC_SYM_TRUE;
+}
+
+static lbm_value ext_cmds_proc(lbm_value *args, lbm_uint argn) {
+	LBM_CHECK_ARGN(1);
+
+	lbm_array_header_t *arr = lbm_dec_array_header(args[0]);
+	if (!arr) {
+		lbm_set_error_reason(lbm_error_str_incorrect_arg);
+		return ENC_SYM_TERROR;
+	}
+
+	if (!cmds_state) {
+		lbm_set_error_reason("Cmds not started");
+		return ENC_SYM_EERROR;
+	}
+
+	for (unsigned int i = 0;i < arr->size;i++) {
+		packet_process_byte(((unsigned char *)arr->data)[i],&(cmds_state->cmds_packet_state));
+	}
+
+	return ENC_SYM_TRUE;
+}
+
 static const char* dyn_functions[] = {
 		"(defun uart-read-bytes (buffer n ofs)"
 		"(let ((rd (uart-read buffer n ofs)))"
@@ -6137,7 +6449,6 @@ void lispif_load_vesc_extensions(bool main_found) {
 		m_uart_mutex = xSemaphoreCreateMutex();
 		uart_mutex_init_done = true;
 	}
-
 
 	if (!event_task_running) {
 		rmsg_mutex = xSemaphoreCreateMutex();
@@ -6302,6 +6613,8 @@ void lispif_load_vesc_extensions(bool main_found) {
 		lbm_add_extension("gnss-date-time", ext_gnss_date_time);
 		lbm_add_extension("gnss-age", ext_gnss_age);
 		lbm_add_extension("ublox-init", ext_ublox_init);
+		lbm_add_extension("nmea-parse", ext_nmea_parse);
+		lbm_add_extension("set-pos-time", ext_set_pos_time);
 
 		// Sleep
 		lbm_add_extension("sleep-deep", ext_sleep_deep);
@@ -6416,6 +6729,10 @@ void lispif_load_vesc_extensions(bool main_found) {
 		// Image
 		lbm_add_extension("image-save", ext_image_save);
 
+		// Commands
+		lbm_add_extension("cmds-start-stop", ext_cmds_start_stop);
+		lbm_add_extension("cmds-proc", ext_cmds_proc);
+
 		// Extension libraries
 		lbm_math_extensions_init();
 		lbm_color_extensions_init();
@@ -6445,6 +6762,7 @@ void lispif_disable_all_events(void) {
 	event_esp_now_rx_en = false;
 	event_ble_rx_en = false;
 	event_wifi_disconnect_en = false;
+	event_cmds_data_tx_en = false;
 
 	event_bms_chg_allow_en = false;
 	event_bms_bal_ovr_en = false;
@@ -6470,6 +6788,13 @@ void lispif_disable_all_events(void) {
 		enc_as504x_deinit(&as504x);
 		as504x_init_done = false;
 	}
+
+	while (cmds_running) {
+		vTaskDelay(1);
+	}
+
+	cmds_running = false;
+	cmds_state = 0;
 }
 
 void lispif_process_can(uint32_t can_id, uint8_t *data8, int len, bool is_ext) {
@@ -6563,11 +6888,11 @@ void lispif_process_rmsg(int slot, unsigned char *data, unsigned int len) {
 		f_lbm_array(&v, len, data);
 		lbm_finish_flatten(&v);
 
-		if (!lbm_unblock_ctx(rmsg_slots[slot].cid, &v)) {
+		if (lbm_unblock_ctx(rmsg_slots[slot].cid, &v)) {
+			rmsg_slots[slot].cid = -1;
+		} else {
 			lbm_free(v.buf);
 		}
-
-		rmsg_slots[slot].cid = -1;
 	}
 
 	xSemaphoreGive(rmsg_mutex);

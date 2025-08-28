@@ -38,7 +38,7 @@
 #define GC_STACK_SIZE			160
 #define PRINT_STACK_SIZE		128
 #ifndef EXTENSION_STORAGE_SIZE
-#define EXTENSION_STORAGE_SIZE	346
+#define EXTENSION_STORAGE_SIZE	350
 #endif
 #ifndef USER_EXTENSION_STORAGE_SIZE
 #define USER_EXTENSION_STORAGE_SIZE 0
@@ -64,11 +64,12 @@ static lbm_buffered_channel_state_t buffered_tok_state;
 static lbm_char_channel_t buffered_string_tok;
 static bool string_tok_valid = false;
 
-static TaskHandle_t eval_task;
+static TaskHandle_t eval_task = 0;
 static volatile bool lisp_thd_running = false;
 static SemaphoreHandle_t lbm_mutex;
 
 static int repl_cid = -1;
+static int main_cid = -1;
 static lbm_cid repl_cid_for_buffer = -1;
 static char *repl_buffer = 0;
 static volatile TickType_t repl_time = 0;
@@ -99,21 +100,24 @@ static void eval_thread(void *arg);
 // Global
 extern lbm_const_heap_t *lbm_const_heap_state;
 
+#define LBM_MEMORY_SIZE_KB(kb) LBM_MEMORY_SIZE_64BYTES_TIMES_X((kb * 16))
+#define LBM_BITMAP_SIZE_KB(kb) LBM_MEMORY_BITMAP_SIZE((kb * 16))
+
 void lispif_init(void) {
 	heap_size = (2048 + 512);
-	mem_size = LBM_MEMORY_SIZE_32K;
-	bitmap_size = LBM_MEMORY_BITMAP_SIZE_32K;
+	mem_size = LBM_MEMORY_SIZE_KB(32);
+	bitmap_size = LBM_BITMAP_SIZE_KB(32);
 
 	if (backup.config.wifi_mode == WIFI_MODE_DISABLED &&
 			backup.config.ble_mode == BLE_MODE_DISABLED) {
 		heap_size *= 2;
-		mem_size *= 3;
-		bitmap_size *= 3;
+		mem_size = LBM_MEMORY_SIZE_KB(86);
+		bitmap_size = LBM_BITMAP_SIZE_KB(86);
 	} else if (backup.config.wifi_mode == WIFI_MODE_DISABLED ||
 			backup.config.ble_mode == BLE_MODE_DISABLED) {
 		heap_size *= 2;
-		mem_size *= 2;
-		bitmap_size *= 2;
+		mem_size = LBM_MEMORY_SIZE_KB(64);
+		bitmap_size = LBM_BITMAP_SIZE_KB(64);
 	}
 
 	heap = memalign(8, heap_size * sizeof(lbm_cons_t));
@@ -178,6 +182,10 @@ static void prof_timer_callback(void* arg) {
 }
 
 static bool pause_eval(uint32_t num_free, uint32_t timeout_ms) {
+	if (!lisp_thd_running) {
+		return false;
+	}
+	
 	int timeout_cnt = timeout_ms;
 
 	if (num_free > 0) {
@@ -227,8 +235,12 @@ void lispif_process_cmd(unsigned char *data, unsigned int len,
 		float mem_use = 0.0;
 
 		if (lisp_thd_running) {
-			uint32_t timeTot = portGET_RUN_TIME_COUNTER_VALUE();
-			portALT_GET_RUN_TIME_COUNTER_VALUE(timeTot);
+			uint32_t timeTot = 0;
+#ifdef portALT_GET_RUN_TIME_COUNTER_VALUE
+			portALT_GET_RUN_TIME_COUNTER_VALUE( timeTot );
+#else
+			timeTot = portGET_RUN_TIME_COUNTER_VALUE();
+#endif
 			if (timeTot > 0) {
 				TaskStatus_t stat;
 				vTaskGetInfo(eval_task, &stat, pdFALSE, 0);
@@ -714,6 +726,11 @@ static void done_callback(eval_context_t *ctx) {
 		lbm_free(repl_buffer);
 		repl_buffer = 0;
 	}
+
+	if (cid == main_cid) {
+		lbm_image_save_constant_heap_ix();
+		main_cid = -1;
+	}
 }
 
 void lispif_stop(void) {
@@ -724,9 +741,20 @@ void lispif_stop(void) {
 	lispif_lock_lbm();
 
 	lbm_kill_eval();
+	int timeout = 2000;
 	while (lisp_thd_running) {
 		lbm_kill_eval();
 		vTaskDelay(1 / portTICK_PERIOD_MS);
+		timeout--;
+		if (timeout == 0) {
+			break;
+		}
+	}
+
+	if (lisp_thd_running) {
+		vTaskDelete(eval_task);
+		lisp_thd_running = false;
+		commands_printf_lisp("Killed eval task as it didn't stop when asked to");
 	}
 
 	lispif_unlock_lbm();
@@ -749,11 +777,13 @@ bool lispif_restart(bool print, bool load_code, bool load_imports) {
 	if (!load_code || (code_data != 0 && code_len > 0)) {
 		lispif_disable_all_events();
 
-		if (lisp_thd_running && lbm_image_exists()) {
-			lbm_image_save_constant_heap_ix();
-		}
+		bool save_heap = lisp_thd_running && lbm_image_exists();
 
 		lispif_stop();
+
+		if (save_heap) {
+			lbm_image_save_constant_heap_ix();
+		}
 
 		int code_chars = 0;
 		if (code_data) {
@@ -762,6 +792,7 @@ bool lispif_restart(bool print, bool load_code, bool load_imports) {
 			code_data = (char*)flash_helper_code_data_raw(CODE_IND_LISP);
 		}
 
+		bool new_image_created = false;
 		image_max_ind = 0;
 		image_ptr = (lbm_uint*)(code_data + code_len + 32);
 		image_ptr = (lbm_uint*)((uint32_t)image_ptr & 0xFFFFFFF0);
@@ -802,11 +833,12 @@ bool lispif_restart(bool print, bool load_code, bool load_imports) {
 				image_max_ind = 0;
 				lbm_image_create(ver_str);
 				load_imports = load_imports_before;
+				new_image_created = true;
 			}
 
 			lbm_image_boot();
 			lbm_add_eval_symbols();
-			lbm_eval_init_events(20);
+			lbm_eval_init_events(30);
 
 			xTaskCreatePinnedToCore(eval_thread, "lbm_eval", 3072, NULL, 6, NULL, tskNO_AFFINITY);
 			lisp_thd_running = true;
@@ -876,7 +908,15 @@ bool lispif_restart(bool print, bool load_code, bool load_imports) {
 			}
 
 			lbm_create_string_char_channel(&string_tok_state, &string_tok, code_data);
-			lbm_load_and_eval_program_incremental(&string_tok, "main-u");
+			main_cid = lbm_load_and_eval_program_incremental(&string_tok, "main-u");
+
+			// The first time a new image is created we save the const heap ptr after main exits. This makes
+			// it more likely to work with code using const blocks from before there were images. We do
+			// not want to store the const heap pointer each reboot as that will consume more flash with
+			// each boot.
+			if (!new_image_created) {
+				main_cid = -1;
+			}
 		}
 
 		lbm_continue_eval();
@@ -899,6 +939,10 @@ void lispif_add_ext_load_callback(void (*p_func)(bool)) {
 			break;
 		}
 	}
+}
+
+bool lispif_is_eval_task(void) {
+	return eval_task == xTaskGetCurrentTaskHandle();
 }
 
 static uint32_t timestamp_callback(void) {

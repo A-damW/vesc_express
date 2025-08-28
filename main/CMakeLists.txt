@@ -49,7 +49,6 @@ set(COMPONENT_SRCS
 "lispBM/src/lbm_c_interop.c"
 "lispBM/src/lbm_custom_type.c"
 "lispBM/src/lbm_flat_value.c"
-"lispBM/src/lbm_flags.c"
 "lispBM/src/lbm_prof.c"
 "lispBM/src/lbm_defrag_mem.c"
 "lispBM/src/lbm_image.c"
@@ -102,6 +101,10 @@ set(COMPONENT_ADD_INCLUDEDIRS
 "hwconf/vesc/vbms32"
 "hwconf/vesc/vdisp_dual"
 "hwconf/vesc/scope"
+"hwconf/vesc/duet"
+"hwconf/vesc/link"
+"hwconf/vesc/vdisp_900"
+"hwconf/vesc/nanolog"
 
 "lispBM"
 "lispBM/include"

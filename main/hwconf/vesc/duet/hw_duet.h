@@ -23,11 +23,15 @@
 #include "driver/gpio.h"
 #include "adc.h"
 
-#define HW_NAME						"VESC_Duet"
-
-#define HW_NO_UART
+#define HW_NAME						"Duet Expr"
 
 #define HW_INIT_HOOK()				hw_init()
+
+// LEDs
+#define LED_BLUE_PIN				3
+
+#define LED_BLUE_ON()				gpio_set_level(LED_BLUE_PIN, 1)
+#define LED_BLUE_OFF()				gpio_set_level(LED_BLUE_PIN, 0)
 
 // CAN
 #define CAN_TX_GPIO_NUM				8

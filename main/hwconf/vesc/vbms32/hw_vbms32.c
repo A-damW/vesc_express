@@ -378,11 +378,12 @@ static uint32_t float_to_u(float number) {
 static void bq_init(uint8_t dev_addr) {
 	command_subcommands(dev_addr, EXIT_DEEPSLEEP);
 	command_subcommands(dev_addr, EXIT_DEEPSLEEP);
-	vTaskDelay(500);
+	vTaskDelay(10);
 
-	command_subcommands(dev_addr, BQ769x2_RESET);
-	vTaskDelay(60);
+	//command_subcommands(dev_addr, BQ769x2_RESET);
+	//vTaskDelay(60);
 
+	command_subcommands(dev_addr, SET_CFGUPDATE);
 	command_subcommands(dev_addr, SET_CFGUPDATE);
 
 	// DPSLP_OT: 1
@@ -396,6 +397,8 @@ static void bq_init(uint8_t dev_addr) {
 	// CB_LOOP_SLOW: 0
 	// LOOP_SLOW: 0
 	// WK_SPD: 0
+	bq_set_reg(dev_addr, PowerConfig, 0b0010011010000000, 2);
+	// Sometimes the first write has no effect. Do a few extra writes just in case...
 	bq_set_reg(dev_addr, PowerConfig, 0b0010011010000000, 2);
 
 	// REG0_EN: 1
@@ -543,26 +546,38 @@ static lbm_value ext_hw_sleep(lbm_value *args, lbm_uint argn) {
 	gpio_set_level(PIN_PCHG_EN, 0);
 	gpio_set_level(PIN_PSW_EN, 0);
 
-	// Put CAN-bus in standby mode
-	gpio_set_level(PIN_COM_EN, 1);
-
 	// Stop balancing
 	m_bal_state_ic1 = 0;
 	m_bal_state_ic2 = 0;
 
-	subcommands_write16(BQ_ADDR_1, CB_ACTIVE_CELLS, m_bal_state_ic1);
-
-	if (m_cells_ic2 != 0) {
-		subcommands_write16(BQ_ADDR_2, CB_ACTIVE_CELLS, m_bal_state_ic2);
+	if (!subcommands_write16(BQ_ADDR_1, CB_ACTIVE_CELLS, m_bal_state_ic1)) {
+		goto exit_error1;
 	}
 
-	// Disable temperature measurement pull-ups
-	bq_set_reg(BQ_ADDR_1, TS1Config, 0x00, 1);
-	bq_set_reg(BQ_ADDR_1, TS3Config, 0x00, 1);
+	if (m_cells_ic2 != 0) {
+		if (!subcommands_write16(BQ_ADDR_2, CB_ACTIVE_CELLS, m_bal_state_ic2)) {
+			goto exit_error2;
+		}
+	}
+
+	// Disable temperature measurement pull-ups and ensure that regulator is kept on in DEEP SLEEP
+	
+	if (!command_subcommands(BQ_ADDR_1, SET_CFGUPDATE) ||
+		!bq_set_reg(BQ_ADDR_1, PowerConfig, 0b0010011010000000, 2) ||
+		!bq_set_reg(BQ_ADDR_1, TS1Config, 0x00, 1) ||
+		!bq_set_reg(BQ_ADDR_1, TS3Config, 0x00, 1) ||
+		!command_subcommands(BQ_ADDR_1, EXIT_CFGUPDATE)) {
+		goto exit_error1;
+	}
 
 	if (m_cells_ic2 != 0) {
-		bq_set_reg(BQ_ADDR_2, TS1Config, 0x00, 1);
-		bq_set_reg(BQ_ADDR_2, TS3Config, 0x00, 1);
+		if (!command_subcommands(BQ_ADDR_2, SET_CFGUPDATE) ||
+			!bq_set_reg(BQ_ADDR_2, PowerConfig, 0b0010011010000000, 2) ||
+			!bq_set_reg(BQ_ADDR_2, TS1Config, 0x00, 1) ||
+			!bq_set_reg(BQ_ADDR_2, TS3Config, 0x00, 1) ||
+			!command_subcommands(BQ_ADDR_2, EXIT_CFGUPDATE)) {
+				goto exit_error2;
+			}
 	}
 
 	command_subcommands(BQ_ADDR_1, DEEPSLEEP);
@@ -572,10 +587,22 @@ static lbm_value ext_hw_sleep(lbm_value *args, lbm_uint argn) {
 		command_subcommands(BQ_ADDR_2, DEEPSLEEP);
 		command_subcommands(BQ_ADDR_2, DEEPSLEEP);
 	}
+	
+	// Disable CAN-bus and other COMM
+	gpio_set_level(PIN_COM_EN, 1);
 
 	xSemaphoreGive(bq_mutex);
-
 	return ENC_SYM_TRUE;
+	
+exit_error1:
+	xSemaphoreGive(bq_mutex);
+	lbm_set_error_reason(error_comm_bq1);
+	return ENC_SYM_EERROR;
+
+exit_error2:
+	xSemaphoreGive(bq_mutex);
+	lbm_set_error_reason(error_comm_bq2);
+	return ENC_SYM_EERROR;
 }
 
 static lbm_value ext_get_vcells(lbm_value *args, lbm_uint argn) {
